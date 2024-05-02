@@ -1,65 +1,73 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
-	"math"
 	"os"
 	"time"
 )
 
-func parseString(data string) (string, float64) {
-	var name string
-	var temp float64
+func parseChunk(data []byte, mp map[string]*res) {
+	prev := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\n' {
+			name, val := parseString(data[prev:i])
+			prev = i + 1
 
+			data, ok := mp[string(name)]
+			if !ok {
+				data = &res{}
+				mp[string(name)] = data
+			}
+
+			data.min = min(data.min, val)
+			data.max = max(data.max, val)
+			data.sum += val
+			data.count++
+		}
+	}
+}
+
+func parseString(data []byte) ([]byte, int32) {
 	for i := len(data) - 1; ; i-- {
 		if data[i] == ';' {
-			name = data[:i]
-			temp = parseFloat(data[i+1:])
-
-			return name, temp
+			return data[:i], parseFloat(data[i+1:])
 		}
 	}
 
-	return "", 0
 }
 
-func parseFloat(data string) float64 {
-	var res float64
-	flag := false
-	var deg float64
+func parseFloat(data []byte) int32 {
+	var res int32
 
-	for i := 0; i < len(data); i++ {
+	var mult int32 = 1
+	i := 0
+
+	if data[0] == '-' {
+		mult = -1
+		i++
+	}
+
+	for ; i < len(data); i++ {
 		if data[i] != '.' {
-			res = res*10 + float64(data[i]-'0')
-		} else if data[i] == '.' && !flag {
-			flag = true
-			deg = pow(i)
+			res = res*10 + int32(data[i]-'0')
 		}
 
 	}
-	return res / deg
-}
-
-func pow(deg int) float64 {
-	var res float64 = 10
-	for i := 1; i < deg; i++ {
-		res *= 10
-	}
-
-	return res
+	return mult * res
 }
 
 type res struct {
-	min   float64
-	sum   float64
-	max   float64
-	count float64
+	min, sum, max, count int32
 }
 
 func main() {
-	t := time.Now()
+	defer func(t time.Time) {
+		fmt.Println(time.Since(t))
+	}(time.Now())
 
 	file, err := os.Open("1brc/measurements.txt")
 	if err != nil {
@@ -67,41 +75,41 @@ func main() {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	chunkSize := 2048 * 1024 * 1024
+
+	buf := make([]byte, chunkSize)
+	leftOver := make([]byte, 0, chunkSize)
 
 	mp := make(map[string]*res)
 
-	for scanner.Scan() {
-		name, temp := parseString(scanner.Text())
+	for {
+		n, err := file.Read(buf)
 
-		if _, ok := mp[name]; !ok {
-			mp[name] = &res{
-				min: math.MaxFloat64,
-				max: -math.MaxFloat64,
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
 			}
+
+			panic(err)
 		}
 
-		v := mp[name]
+		buf = buf[:n]
 
-		v.count += 1
+		toSend := make([]byte, n)
+		copy(toSend, buf)
 
-		v.sum += temp
+		lastNewLineIndex := bytes.LastIndexByte(buf, '\n')
 
-		if v.min > temp {
-			v.min = temp
-		} else if v.max < temp {
-			v.max = temp
-		}
+		toSend = append(leftOver, buf[:lastNewLineIndex]...)
+		leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
+		copy(leftOver, buf[lastNewLineIndex+1:])
+
+		parseChunk(toSend, mp)
 
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Fatal(err)
+	for k, v := range mp {
+		fmt.Printf("%s: min: %.1f, max: %.1f, avg: %.1f\n", k, float32(v.min)/10, float32(v.max)/10, float32(v.sum/v.count)/10)
 	}
 
-	for key, val := range mp {
-		fmt.Printf("%s;%f;%f;%f\n", key, val.min, val.sum/val.count, val.max)
-	}
-
-	fmt.Println(time.Since(t))
 }
