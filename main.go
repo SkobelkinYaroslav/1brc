@@ -8,12 +8,19 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"time"
 )
 
 const (
 	maxWorkStation = 10000
 )
+
+func worker(jobs <-chan []byte, mp *customMap) {
+	for data := range jobs {
+		parseChunk(data, mp)
+	}
+}
 
 func parseChunk(data []byte, cm *customMap) {
 	prev := 0
@@ -120,6 +127,14 @@ func main() {
 		fmt.Println(time.Since(t))
 	}(time.Now())
 
+	goRoutineCount := min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
+	jobs := make(chan []byte, goRoutineCount)
+	mp := make(customMap, maxWorkStation)
+
+	for i := 0; i < goRoutineCount; i++ {
+		go worker(jobs, &mp)
+	}
+
 	file, err := os.Open("1brc/measurements.txt")
 	if err != nil {
 		log.Fatal(err)
@@ -130,8 +145,6 @@ func main() {
 
 	buf := make([]byte, chunkSize)
 	leftOver := make([]byte, 0, chunkSize)
-
-	mp := make(customMap, maxWorkStation)
 
 	for {
 		n, err := file.Read(buf)
@@ -155,7 +168,7 @@ func main() {
 		leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
 		copy(leftOver, buf[lastNewLineIndex+1:])
 
-		parseChunk(toSend, &mp)
+		jobs <- toSend
 
 	}
 
