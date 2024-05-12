@@ -6,3 +6,4 @@ added chunking: 1m17.3726563s
 
 concurrent parsing: 57.7707635s
 
+concurrent + optimized parsing: 9.4964078s

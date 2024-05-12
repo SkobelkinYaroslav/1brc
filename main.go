@@ -4,182 +4,160 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
-	"log"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 )
 
-const (
-	maxWorkStation = 10000
-)
-
-func worker(jobs <-chan []byte, mp *customMap) {
-	for data := range jobs {
-		parseChunk(data, mp)
-	}
+type res struct {
+	min, sum, max, count int64
 }
 
-func parseChunk(data []byte, cm *customMap) {
-	prev := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\n' {
-			name, val := parseString(data[prev:i])
-			prev = i + 1
+func parseChunk(data []byte) map[string]*res {
+	result := make(map[string]*res, 500)
 
-			arrayData := cm.get(name)
+	strBuff := string(data)
 
-			if arrayData == nil {
-				arrayData = &node{}
+	start := 0
+	end := 0
+
+	for i, char := range strBuff {
+		switch char {
+		case ';':
+			end = i
+		case '\n':
+			city := strBuff[start:end]
+			val := parseFloat(strBuff[end+1 : i])
+
+			if item, ok := result[city]; ok {
+				item.min = min(item.min, val)
+				item.max = max(item.max, val)
+				item.sum += val
+				item.count++
+			} else {
+				result[city] = &res{min: val, max: val, sum: val, count: 1}
 			}
 
-			cm.put(name, val)
-
+			start = i + 1
 		}
 	}
+	return result
 }
 
-func parseString(data []byte) ([]byte, int32) {
-	for i := len(data) - 1; ; i-- {
-		if data[i] == ';' {
-			return data[:i], parseFloat(data[i+1:])
-		}
-	}
-
-}
-
-func parseFloat(data []byte) int32 {
-	var res int32
-
-	var mult int32 = 1
-	i := 0
-
+func parseFloat(data string) int64 {
+	var res int64
+	var mult int64 = 1
 	if data[0] == '-' {
 		mult = -1
-		i++
+		data = data[1:]
+	}
+	switch len(data) {
+	case 3:
+		res = int64(data[0])*10 + int64(data[2]) - int64('0')*11
+	case 4:
+		res = int64(data[0])*100 + int64(data[1])*10 + int64(data[3]) - (int64('0') * 111)
 	}
 
-	for ; i < len(data); i++ {
-		if data[i] != '.' {
-			res = res*10 + int32(data[i]-'0')
-		}
-
-	}
 	return mult * res
-}
-
-type res struct {
-	min, sum, max, count int32
-}
-
-type node struct {
-	key []byte
-	res
-	next *node
-}
-
-type customMap []*node
-
-func (c *customMap) put(key []byte, val int32) {
-	index := hash(key) % maxWorkStation
-	nd := (*c)[index]
-
-	if nd == nil {
-		(*c)[index] = &node{key: key, res: res{min: val, max: val, sum: val, count: 1}}
-	} else {
-		for nd.next != nil && !bytes.Equal(key, nd.key) {
-			nd = nd.next
-		}
-
-		if bytes.Equal(key, nd.key) {
-			nd.res = res{min: min(nd.min, val), max: max(nd.max, val), sum: nd.sum + val, count: nd.count + 1}
-		} else {
-			nd.next = &node{key: key, res: res{min: val, max: val, sum: val, count: 1}}
-		}
-	}
-}
-
-func (c *customMap) get(key []byte) *node {
-	index := hash(key) % maxWorkStation
-	nd := (*c)[index]
-
-	for nd != nil && !bytes.Equal(key, nd.key) {
-		nd = nd.next
-	}
-
-	if nd != nil {
-		return nd
-	}
-
-	return nil
-}
-
-func hash(s []byte) int {
-	h := fnv.New32a()
-	h.Write(s)
-	return int(h.Sum32())
 }
 
 func main() {
 	defer func(t time.Time) {
-		fmt.Println(time.Since(t))
+		fmt.Println("Execution time: ", time.Since(t))
 	}(time.Now())
 
-	goRoutineCount := min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-	jobs := make(chan []byte, goRoutineCount)
-	mp := make(customMap, maxWorkStation)
+	goRoutineCount := runtime.NumCPU()
+	chunkStream := make(chan []byte, 1000)
+	resultStream := make(chan map[string]*res, 1000)
 
-	for i := 0; i < goRoutineCount; i++ {
-		go worker(jobs, &mp)
+	mp := make(map[string]*res)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < goRoutineCount-1; i++ {
+		wg.Add(1)
+		go func() {
+			for data := range chunkStream {
+				resultStream <- parseChunk(data)
+			}
+			wg.Done()
+		}()
 	}
 
 	file, err := os.Open("1brc/measurements.txt")
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer file.Close()
 
-	chunkSize := 2048 * 1024 * 1024
+	chunkSize := 8 * 1024 * 1024
 
-	buf := make([]byte, chunkSize)
-	leftOver := make([]byte, 0, chunkSize)
+	go func() {
+		buf := make([]byte, chunkSize)
+		leftOver := make([]byte, 0, chunkSize)
+		for {
+			readTotal, err := file.Read(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
 
-	for {
-		n, err := file.Read(buf)
-
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
+				panic(err)
 			}
+			buf = buf[:readTotal]
 
-			panic(err)
+			toSend := make([]byte, readTotal)
+			copy(toSend, buf)
+
+			lastNewLineIndex := bytes.LastIndexByte(buf, '\n')
+
+			toSend = append(leftOver, buf[:lastNewLineIndex+1]...)
+
+			leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
+			copy(leftOver, buf[lastNewLineIndex+1:])
+			chunkStream <- toSend
+
 		}
 
-		buf = buf[:n]
+		close(chunkStream)
+		wg.Wait()
+		close(resultStream)
+	}()
 
-		toSend := make([]byte, n)
-		copy(toSend, buf)
-
-		lastNewLineIndex := bytes.LastIndexByte(buf, '\n')
-
-		toSend = append(leftOver, buf[:lastNewLineIndex]...)
-		leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
-		copy(leftOver, buf[lastNewLineIndex+1:])
-
-		jobs <- toSend
+	for data := range resultStream {
+		for key, val := range data {
+			if item, ok := mp[key]; ok {
+				item.min = min(item.min, val.min)
+				item.max = max(item.max, val.max)
+				item.sum += val.sum
+				item.count += val.count
+			} else {
+				mp[key] = val
+			}
+		}
 
 	}
 
-	for _, item := range mp {
-		if item != nil {
-			fmt.Printf("%s: min: %.1f, max: %.1f, avg: %.1f\n", item.key, float32(item.min)/10, float32(item.sum/item.count)/10, float32(item.max)/10)
-			for item.next != nil {
-				item = item.next
-				fmt.Printf("%s: min: %.1f, max: %.1f, avg: %.1f\n", item.key, float32(item.min)/10, float32(item.max)/10, float32(item.sum/item.count)/10)
-			}
-		}
+	//expected := advanced.Advanced()
+	//
+	//for key, item := range mp {
+	//	if val, ok := expected[key]; ok {
+	//		if item.min != val.Min || item.max != val.Max || item.sum != val.Sum || item.count != val.Count {
+	//			fmt.Printf("Error: %s: min: %d, max: %d, sum: %d, count: %d\n", key, item.min, item.max, item.sum, item.count)
+	//		}
+	//	} else {
+	//		fmt.Printf("Error: %s: min: %d, max: %d, sum: %d, count: %d\n", key, item.min, item.max, item.sum, item.count)
+	//	}
+	//
+	//}
+	//var count int64 = 0
+	for key, item := range mp {
+		//count += item.count
+		fmt.Printf("%s: min: %.1f, max: %.1f, avg: %.1f\n", key, float32(item.min)/10, float32(item.sum/item.count)/10, float32(item.max)/10)
 	}
+
+	//log.Println("count: ", count)
 
 }
